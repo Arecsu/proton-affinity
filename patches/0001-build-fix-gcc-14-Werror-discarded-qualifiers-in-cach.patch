@@ -1,0 +1,53 @@
+From daaa945191c6f471ff9156194c5736fbf869d362 Mon Sep 17 00:00:00 2001
+From: Arecsu <alejandro9r@gmail.com>
+Date: Sat, 2 May 2026 17:24:26 -0300
+Subject: [PATCH 01/14] build: fix gcc-14 -Werror=discarded-qualifiers in
+ cachyos EAC hack
+
+---
+ dlls/kernelbase/process.c         | 2 +-
+ dlls/ntdll/unix/virtual.c         | 2 +-
+ dlls/winegstreamer/wg_transform.c | 4 ++--
+ 3 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+index 8be6c7e785b..fc2e98cb3ac 100644
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -789,7 +789,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
+             sync_env_var_to_unix( new_env, "UPLAY_ARGUMENTS" );
+             sync_env_var_to_unix( new_env, "UPC_GAME_STARTER_RUNNING" );
+ 
+-            p = app_name + wcslen( app_name );
++            p = (WCHAR *)app_name + wcslen( app_name );
+             while (p != app_name && *p != '/' && *p != '\\') --p;
+             if (p != app_name)
+             {
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 6e1697720f0..5de855edb73 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2553,7 +2553,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
+     else
+     {
+         void *start = address_space_start;
+-        void *end = min( effective_user_space_limit, host_addr_space_limit );
++        void *end = (void *)min( effective_user_space_limit, host_addr_space_limit );
+         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
+ 
+         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
+diff --git a/dlls/winegstreamer/wg_transform.c b/dlls/winegstreamer/wg_transform.c
+index 5e9d9169309..bde632aaa0b 100644
+--- a/dlls/winegstreamer/wg_transform.c
++++ b/dlls/winegstreamer/wg_transform.c
+@@ -1086,8 +1086,8 @@ NTSTATUS wg_transform_push_data(void *args)
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS copy_video_buffer(GstBuffer *buffer, GstVideoInfo *src_video_info,
+-        GstVideoInfo *dst_video_info, struct wg_sample *sample, gsize *total_size, GstBuffer **ret_buffer)
++static NTSTATUS copy_video_buffer(GstBuffer *buffer, const GstVideoInfo *src_video_info,
++        const GstVideoInfo *dst_video_info, struct wg_sample *sample, gsize *total_size, GstBuffer **ret_buffer)
+ {
+     NTSTATUS status = STATUS_UNSUCCESSFUL;
+     GstVideoFrame src_frame, dst_frame;

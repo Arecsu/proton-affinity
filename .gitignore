@@ -1,0 +1,9 @@
+# Proton source tree — huge, re-cloned by build.sh --fetch
+.proton-src/
+
+# Claude Code session data
+.claude/
+
+# Build artifacts
+build.log
+*.log

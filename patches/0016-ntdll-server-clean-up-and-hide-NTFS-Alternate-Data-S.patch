@@ -1,0 +1,153 @@
+From 3c5e00c2457dcdfd8448f26b208399fc67b3f713 Mon Sep 17 00:00:00 2001
+From: Arecsu <alejandro9r@gmail.com>
+Date: Mon, 4 May 2026 16:31:19 -0300
+Subject: [PATCH] ntdll, server: clean up and hide NTFS Alternate Data Stream
+ files
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When an application creates an NTFS Alternate Data Stream — using the
+colon syntax 'filename:streamname' — Wine on host filesystems lacking
+native stream support stores it as a sibling file with a literal colon
+in the name. Two semantic gaps with real NTFS follow:
+
+  - On NTFS, all streams attached to a file are removed automatically
+    when the parent file is unlinked. Wine's wineserver delete path
+    only unlinks the exact path it was given, so the sibling stream
+    files leak. Add unlink_companion_streams() in server/fd.c which
+    scans the parent directory after a successful unlink and removes
+    any '<basename>:*' siblings (with a guard so stream files don't
+    trigger their own scan).
+
+  - On NTFS, streams have no independent presence in directory listings;
+    they are an internal feature of the parent file. Wine's stream
+    files appear as ordinary entries. Extend is_hidden_file() in
+    dlls/ntdll/unix/file.c to treat any basename containing ':' as
+    hidden, reusing the same mechanism Wine already applies to Unix
+    dotfiles — no extra xattr writes needed, and queries via
+    NtQueryInformationFile (and friends) report FILE_ATTRIBUTE_HIDDEN.
+
+Note: this only governs Wine's own view of the attribute. Linux file
+managers (Nautilus, Dolphin, etc.) decide what to hide based on Unix
+conventions — typically a leading '.' or, in some implementations
+including Nautilus, a trailing '~'. They do not consult the
+user.DOSATTRIB extended attribute, so a stream file like
+'foo.af~lock~:com.dropbox.ignored' will still be visible in those
+file managers even after this patch, because its name contains '~'
+in the middle rather than at the end. Making the on-disk filename
+match Linux hiding conventions would require changing Wine's
+stream-storage scheme (e.g. trailing '~' or a hidden subdirectory),
+which is out of scope here.
+---
+ dlls/ntdll/unix/file.c | 12 +++++++--
+ server/fd.c            | 60 +++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 69 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index dcdb785ff38d..b157a4b3381c 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -1357,11 +1357,19 @@ static BOOL is_hidden_file( const char *name )
+ {
+     const char *p;
+ 
+-    if (show_dot_files) return FALSE;
+-
+     p = name + strlen( name );
+     while (p > name && p[-1] == '/') p--;
+     while (p > name && p[-1] != '/') p--;
++
++    /* NTFS Alternate Data Streams are stored on host filesystems lacking
++     * native stream support as sibling files named "<basename>:<streamname>".
++     * The colon syntax can never appear in a regular Win32 filename, so its
++     * presence in the basename uniquely identifies a stream — and on real
++     * NTFS streams have no independent presence in directory listings, so
++     * treating them as hidden matches user expectations. */
++    if (strchr( p, ':' )) return TRUE;
++
++    if (show_dot_files) return FALSE;
+     if (*p++ != '.') return FALSE;
+     if (!*p || *p == '/') return FALSE;  /* "." directory */
+     if (*p++ != '.') return TRUE;
+diff --git a/server/fd.c b/server/fd.c
+index f7ca02df53ec..e4f9eb955d1a 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -1101,6 +1101,60 @@ static void device_destroy( struct object *obj )
+ /****************************************************************/
+ /* inode functions */
+ 
++/* Remove any companion files that represent NTFS Alternate Data Streams of
++ * the just-unlinked file. On NTFS, all streams attached to a file are removed
++ * with their parent; Wine on host filesystems without native stream support
++ * stores each stream as a sibling file named "<basename>:<streamname>", so we
++ * have to scan the parent directory and unlink them by hand. */
++static void unlink_companion_streams( const char *unix_name )
++{
++    const char *slash = strrchr( unix_name, '/' );
++    const char *base = slash ? slash + 1 : unix_name;
++    size_t base_len = strlen( base );
++    char *dir_path;
++    DIR *dir;
++    struct dirent *de;
++
++    /* Skip empty basenames (defense in depth — would otherwise match any
++     * sibling starting with ':') and basenames already containing ':' (the
++     * unlinked file is itself a stream; streams of streams don't exist). */
++    if (!base_len || memchr( base, ':', base_len )) return;
++
++    if (slash)
++    {
++        if (!(dir_path = malloc( slash - unix_name + 2 ))) return;
++        memcpy( dir_path, unix_name, slash - unix_name + 1 );
++        dir_path[slash - unix_name + 1] = 0;
++    }
++    else
++    {
++        if (!(dir_path = strdup( "." ))) return;
++    }
++
++    if ((dir = opendir( dir_path )))
++    {
++        while ((de = readdir( dir )))
++        {
++            const char *name = de->d_name;
++            if (strncmp( name, base, base_len ) || name[base_len] != ':') continue;
++            if (slash)
++            {
++                char *full = malloc( strlen( dir_path ) + strlen( name ) + 1 );
++                if (full)
++                {
++                    strcpy( full, dir_path );
++                    strcat( full, name );
++                    unlink( full );
++                    free( full );
++                }
++            }
++            else unlink( name );
++        }
++        closedir( dir );
++    }
++    free( dir_path );
++}
++
+ static void unlink_closed_fd( struct inode *inode, struct closed_fd *fd )
+ {
+     /* make sure it is still the same file */
+@@ -1108,7 +1162,11 @@ static void unlink_closed_fd( struct inode *inode, struct closed_fd *fd )
+     if (!stat( fd->unix_name, &st ) && st.st_dev == inode->device->dev && st.st_ino == inode->ino)
+     {
+         if (S_ISDIR(st.st_mode)) rmdir( fd->unix_name );
+-        else unlink( fd->unix_name );
++        else
++        {
++            unlink( fd->unix_name );
++            unlink_companion_streams( fd->unix_name );
++        }
+     }
+ }
+ 
+-- 
+2.54.0
+

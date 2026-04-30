@@ -1,0 +1,255 @@
+From f3a31e8cb38885f302d9db76a715b35baeda0c53 Mon Sep 17 00:00:00 2001
+From: Arecsu <alejandro9r@gmail.com>
+Date: Sun, 5 Apr 2026 22:56:11 -0300
+Subject: [PATCH 13/14] winewayland: implement owned windows as subsurfaces
+ with z-order and floating window support
+
+- Promote owned (child-like) windows to wl_subsurface children of their
+  toplevel parent instead of independent xdg_toplevel surfaces. This
+  allows floating panels, toolbars, and docked windows to participate
+  in the parent's surface tree, fixing stacking against dialogs and
+  menus.
+- Add find_subsurface_below() to walk GW_HWNDNEXT z-order and place
+  each subsurface above its nearest lower sibling, honouring Win32
+  paint order. Menus and dialogs now correctly appear above floating
+  panels.
+- Remove the processing.serial gate in wayland_surface_reconfigure_subsurface()
+  so position and stacking are applied immediately on every configure
+  call rather than waiting for an ack round-trip.
+- Cache the last committed subsurface offset in subsurface_x/y fields
+  (added to waylanddrv.h) to allow pointer coordinate compensation.
+- Fix SC_MOVE return path so dragging a floating window sends the
+  correct final position commit, enabling re-docking.
+---
+ dlls/winewayland.drv/wayland_surface.c | 115 +++++++++++++++++--------
+ dlls/winewayland.drv/waylanddrv.h      |   1 +
+ dlls/winewayland.drv/window.c          |  34 +++++++-
+ 3 files changed, 111 insertions(+), 39 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 5d2833dfb6e..f9842e98fb9 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -543,6 +543,8 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
+ 
+     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     surface->toplevel_hwnd = parent->hwnd;
++    surface->subsurface_x = -0x7fffffff;
++    surface->subsurface_y = -0x7fffffff;
+ 
+     /* Present contents independently of the parent surface. */
+     wl_subsurface_set_desync(surface->wl_subsurface);
+@@ -933,57 +935,94 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
+  * Reconfigures the subsurface as needed to match the latest requested
+  * state.
+  */
++/* Find the wl_surface of the subsurface sibling that should be directly
++ * below this hwnd in the Win32 z-order. Returns the client/toplevel surface
++ * if no lower sibling subsurface exists. This ensures menus and dialogs
++ * stack above floating panels when they have higher z-order. */
++static struct wl_surface *find_subsurface_below(struct wayland_surface *surface,
++                                                 struct wayland_win_data *toplevel_data,
++                                                 struct wayland_surface *toplevel_surface)
++{
++    struct wl_surface *below = NULL;
++    HWND prev;
++
++    /* Walk windows below us in z-order (GW_HWNDNEXT = lower z-order) to find
++     * the first sibling that is also a subsurface of the same toplevel. */
++    for (prev = NtUserGetWindowRelative(surface->hwnd, GW_HWNDNEXT); prev;
++         prev = NtUserGetWindowRelative(prev, GW_HWNDNEXT))
++    {
++        struct wayland_win_data *prev_data = wayland_win_data_get_nolock(prev);
++        if (prev_data && prev_data->wayland_surface &&
++            prev_data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
++            prev_data->wayland_surface->wl_subsurface &&
++            prev_data->wayland_surface->toplevel_hwnd == surface->toplevel_hwnd)
++        {
++            below = prev_data->wayland_surface->wl_surface;
++            break;
++        }
++    }
++
++    if (below) return below;
++
++    /* No lower sibling subsurface — place above the client surface (DXVK
++     * canvas) or the toplevel surface itself. */
++    if (toplevel_data->client_surface)
++        return toplevel_data->client_surface->wl_surface;
++
++    /* Check child windows for client surface */
++    {
++        HWND child = NtUserGetWindowRelative(surface->toplevel_hwnd, GW_CHILD);
++        while (child)
++        {
++            struct wayland_win_data *child_data = wayland_win_data_get_nolock(child);
++            if (child_data && child_data->client_surface &&
++                child_data->client_surface->wl_subsurface)
++                return child_data->client_surface->wl_surface;
++            child = NtUserGetWindowRelative(child, GW_HWNDNEXT);
++        }
++    }
++
++    return toplevel_surface->wl_surface;
++}
++
+ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surface)
+ {
+     struct wayland_win_data *toplevel_data;
+     struct wayland_surface *toplevel_surface;
++    struct wl_surface *place_above_ref;
+     int local_x, local_y, x, y;
++    BOOL position_changed;
+ 
+-    if (surface->processing.serial && surface->processing.processed &&
+-        (toplevel_data = wayland_win_data_get_nolock(surface->toplevel_hwnd)) &&
+-        (toplevel_surface = toplevel_data->wayland_surface))
+-    {
+-        local_x = surface->window.rect.left - toplevel_surface->window.rect.left;
+-        local_y = surface->window.rect.top - toplevel_surface->window.rect.top;
++    if (!(toplevel_data = wayland_win_data_get_nolock(surface->toplevel_hwnd)) ||
++        !(toplevel_surface = toplevel_data->wayland_surface))
++        return;
+ 
+-        wayland_surface_coords_from_window(surface, local_x, local_y, &x, &y);
++    local_x = surface->window.rect.left - toplevel_surface->window.rect.left;
++    local_y = surface->window.rect.top - toplevel_surface->window.rect.top;
+ 
+-        TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, x, y);
++    wayland_surface_coords_from_window(surface, local_x, local_y, &x, &y);
++
++    /* Skip redundant position updates to reduce jitter from rounding with
++     * fractional scaling. */
++    position_changed = (x != surface->subsurface_x || y != surface->subsurface_y);
+ 
++    if (position_changed)
++    {
++        TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, x, y);
++        surface->subsurface_x = x;
++        surface->subsurface_y = y;
+         wl_subsurface_set_position(surface->wl_subsurface, x, y);
+-        if (toplevel_data->client_surface)
+-        {
+-            wl_subsurface_place_above(surface->wl_subsurface, toplevel_data->client_surface->wl_surface);
+-        }
+-        else
+-        {
+-            /* The client surface (e.g. DXVK canvas) may be owned by a child
+-             * window rather than the toplevel itself.  Walk the children to
+-             * find it so that popup subsurfaces (menus, floating widgets) are
+-             * placed above the rendering canvas and receive input correctly. */
+-            struct wayland_client_surface *child_client = NULL;
+-            HWND child = NtUserGetWindowRelative(surface->toplevel_hwnd, GW_CHILD);
+-            while (child)
+-            {
+-                struct wayland_win_data *child_data = wayland_win_data_get_nolock(child);
+-                if (child_data && child_data->client_surface &&
+-                    child_data->client_surface->wl_subsurface)
+-                {
+-                    child_client = child_data->client_surface;
+-                    break;
+-                }
+-                child = NtUserGetWindowRelative(child, GW_HWNDNEXT);
+-            }
++    }
+ 
+-            if (child_client)
+-                wl_subsurface_place_above(surface->wl_subsurface, child_client->wl_surface);
+-            else
+-                wl_subsurface_place_above(surface->wl_subsurface, toplevel_surface->wl_surface);
+-        }
+-        wl_surface_commit(toplevel_surface->wl_surface);
++    /* Stack subsurfaces according to Win32 z-order so menus and dialogs
++     * render above floating panels. */
++    place_above_ref = find_subsurface_below(surface, toplevel_data, toplevel_surface);
++    wl_subsurface_place_above(surface->wl_subsurface, place_above_ref);
+ 
++    wl_surface_commit(toplevel_surface->wl_surface);
++
++    if (surface->processing.serial)
+         memset(&surface->processing, 0, sizeof(surface->processing));
+-    }
+ }
+ 
+ /**********************************************************************
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 1ea56c3fd43..eef2b7da0f8 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -382,6 +382,7 @@ struct wayland_surface
+         {
+             struct wl_subsurface *wl_subsurface;
+             HWND toplevel_hwnd;
++            int subsurface_x, subsurface_y;
+         };
+     };
+ 
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index d1ccdd115dd..cbf19df248e 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -230,6 +230,9 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+ 
++    TRACE("hwnd=%p style=%08x exstyle=%08x visible=%d role=%d toplevel_surface=%p\n",
++          data->hwnd, (unsigned)style, (unsigned)exstyle, visible, role, toplevel_surface);
++
+     /* we can temporarily clear the role of a surface but cannot assign a different one after it's set */
+     if ((surface = data->wayland_surface) && role && surface->role && surface->role != role)
+     {
+@@ -528,6 +531,25 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+      * acquire the lock itself internally. */
+     if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) toplevel = owner_hint;
+ 
++    /* Owned windows should be subsurfaces of their owner's toplevel, even if
++     * managed. This ensures they move with the parent, share z-order, don't
++     * appear in alt-tab, and menus render above them. The owner's root
++     * ancestor is the toplevel we parent to. */
++    if (owner_hint && toplevel == hwnd)
++    {
++        HWND owner_root = NtUserGetAncestor(owner_hint, GA_ROOT);
++        if (owner_root) toplevel = owner_root;
++    }
++
++    {
++        DWORD _style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++        DWORD _exstyle = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++        HWND _ga_root = NtUserGetAncestor(hwnd, GA_ROOT);
++        HWND _parent = NtUserGetAncestor(hwnd, GA_PARENT);
++        TRACE("HIERARCHY hwnd=%p style=%08x exstyle=%08x ga_root=%p parent=%p owner_hint=%p toplevel=%p managed=%d surface=%p\n",
++              hwnd, (unsigned)_style, (unsigned)_exstyle, _ga_root, _parent, owner_hint, toplevel, managed, surface);
++    }
++
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
+     toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
+@@ -555,6 +577,16 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface))
+     {
+         wayland_win_data_update_wayland_state(data);
++
++        /* For subsurfaces, immediately update position so moves are visible.
++         * Content flushes don't happen during position-only changes. */
++        if (data->wayland_surface &&
++            data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
++            data->wayland_surface->wl_subsurface)
++        {
++            wayland_surface_reconfigure(data->wayland_surface);
++            wl_display_flush(process_wayland.wl_display);
++        }
+     }
+ 
+     wayland_win_data_release(data);
+@@ -878,10 +910,10 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT
+                     xdg_toplevel_resize(surface->xdg_toplevel, wl_seat, button_serial,
+                                         hittest_to_resize_edge(wparam & 0x0f));
+                 }
++                ret = 0;
+             }
+             pthread_mutex_unlock(&process_wayland.seat.mutex);
+             wayland_win_data_release(data);
+-            ret = 0;
+         }
+     }
+ 

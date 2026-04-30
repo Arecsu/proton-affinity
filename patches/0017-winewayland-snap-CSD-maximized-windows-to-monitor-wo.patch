@@ -1,0 +1,69 @@
+From 70430fe38454dd65618569287e53286d1ae8a663 Mon Sep 17 00:00:00 2001
+From: Arecsu <alejandro9r@gmail.com>
+Date: Mon, 4 May 2026 22:14:57 -0300
+Subject: [PATCH 1/2] winewayland: snap CSD maximized windows to monitor work
+ area
+
+When a wayland configure event sets the maximized state on a window
+that uses client-side decorations (the compositor is not drawing the
+title bar / borders for us), Wine's WM_GETMINMAXINFO computes the
+window placement with a negative WS_THICKFRAME inset on the top-left,
+inherited from the Windows server-side-decoration convention where
+the OS hides the resize border underneath the screen edge. With CSD
+there is no such border to hide, so that inset is dead space that
+visibly shifts the window's drawn content past the maximized work
+area and produces a small gap on the top and left edges.
+
+Override the position in the wayland driver's configure handler:
+when transitioning to or staying in maximized state on a CSD window,
+snap the window's top-left to the monitor's work-area origin instead
+of inheriting the inset position Wine has already committed. The size
+already comes from the compositor's configure (work-area sized) so
+the resulting rect fills the work area exactly.
+
+Note: a transient blur of the canvas may still be visible during a
+fast maximize \xe2\x86\x92 shrink \xe2\x86\x92 maximize cycle. That is the host Vulkan
+WSI / DXVK swapchain not yet matching the new wayland surface size,
+which the compositor compensates for by stretching the previous frame
+until DXVK presents a new swapchain at the new size; it is outside the
+scope of this fix.
+---
+ dlls/winewayland.drv/window.c | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index b78498a4bd5b..65d1b71dd1ff 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -733,7 +733,27 @@ static void wayland_configure_window(HWND hwnd)
+     }
+ 
+     SetRect(&rect, 0, 0, window_width, window_height);
+-    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
++    /* For maximized windows under client-side decorations we override the
++     * default position. Win32's WM_GETMINMAXINFO returns ptMaxPosition with
++     * a negative WS_THICKFRAME inset (so the resize border falls under the
++     * screen edge — a Windows SSD convention), and Wine has already moved
++     * the window there by the time the configure arrives. With CSD there is
++     * no actual border to hide, so that inset is dead space that visibly
++     * shifts the window's drawn content past the maximized work area. Snap
++     * the maximized window to the monitor work-area origin instead. */
++    if ((state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
++        surface->processing.decor != ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
++    {
++        HMONITOR mon = NtUserMonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
++        MONITORINFO mi = {.cbSize = sizeof(mi)};
++        if (mon && NtUserGetMonitorInfo(mon, &mi))
++        {
++            OffsetRect(&rect, mi.rcWork.left, mi.rcWork.top);
++            flags &= ~SWP_NOMOVE;
++        }
++        else OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
++    }
++    else OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
+ 
+     wayland_win_data_release(data);
+ 
+-- 
+2.54.0
+

@@ -1,0 +1,58 @@
+From b45b0dd6e1b92de36c48df55825e7b9b17d0c509 Mon Sep 17 00:00:00 2001
+From: Arecsu <alejandro9r@gmail.com>
+Date: Mon, 4 May 2026 22:15:24 -0300
+Subject: [PATCH 2/2] winewayland: floor client subsurface position to hide
+ fractional-scale edge gaps
+
+A Vulkan client subsurface (the canvas in apps such as Affinity Designer
+or Photo) is positioned within its parent toplevel using
+wl_subsurface_set_position, which takes integer logical coordinates.
+At fractional scale (e.g. 1.5x), the buffer-pixel offset of the client
+area against the parent rarely converts to an integer logical position,
+and round-to-nearest can place the subsurface a sub-pixel later than
+the boundary up to which the parent's GDI surface has cleared the
+canvas-area background. The compositor's resampler then exposes that
+sub-pixel of cleared background as a thin lighter line on the top and
+left edges of the canvas. The same artifact appears in detached canvas
+mode because the underlying mechanism (logical-pixel rounding of a
+buffer-pixel offset) is identical there.
+
+Floor the position so the subsurface always starts at or before the
+boundary, and ceil the size so it still extends to the original right
+and bottom edges. The subsurface ends up at most one buffer pixel
+larger than the source widget rect; the extra pixel is hidden behind
+the parent's GDI panel (or off the screen edge for a detached canvas)
+and the lighter line disappears.
+---
+ dlls/winewayland.drv/wayland_surface.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index f9842e98fb91..e134339800e1 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -865,9 +865,18 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
+     client_width = client_rect->right - client_rect->left;
+     client_height = client_rect->bottom - client_rect->top;
+ 
+-    wayland_surface_coords_from_window(surface, client_x, client_y, &x, &y);
+-    wayland_surface_coords_from_window(surface, client_width, client_height,
+-                                       &width, &height);
++    /* Floor-round the client subsurface position rather than round-to-nearest:
++     * the parent's GDI surface has cleared the area underneath this client up
++     * to buffer pixel client_{x,y}, but at fractional scale a round-to-nearest
++     * subsurface position can land a sub-pixel later than that boundary,
++     * exposing a thin strip of the parent's clear color (typically white) at
++     * the top and left edges. Flooring guarantees the subsurface starts at or
++     * before the boundary, hiding the strip. Use ceil for the size so the
++     * subsurface still extends to the original right/bottom edge. */
++    x = (int)floor((double)client_x / surface->window.scale);
++    y = (int)floor((double)client_y / surface->window.scale);
++    width  = (int)ceil ((double)(client_x + client_width)  / surface->window.scale) - x;
++    height = (int)ceil ((double)(client_y + client_height) / surface->window.scale) - y;
+ 
+     TRACE("hwnd=%p subsurface=%d,%d+%dx%d\n", surface->hwnd, x, y, width, height);
+ 
+-- 
+2.54.0
+

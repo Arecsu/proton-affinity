@@ -1,0 +1,56 @@
+From ead7652d9a97aa1bceb15ee35f12b81bf2af4b0a Mon Sep 17 00:00:00 2001
+From: Arecsu <alejandro9r@gmail.com>
+Date: Tue, 31 Mar 2026 01:10:19 -0300
+Subject: [PATCH 05/14] winewayland: Fix subsurface positioning for child
+ windows
+
+The client surface (e.g. DXVK canvas) may be owned by a child window
+rather than the toplevel itself. Walk the children to find it so that
+popup subsurfaces (menus, floating widgets) are placed above the
+rendering canvas and receive input correctly.
+
+Fixes Affinity menus not showing (going behind document window/panel).
+---
+ dlls/winewayland.drv/wayland_surface.c | 27 +++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 46b50352b30..5d2833dfb6e 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -952,9 +952,34 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
+ 
+         wl_subsurface_set_position(surface->wl_subsurface, x, y);
+         if (toplevel_data->client_surface)
++        {
+             wl_subsurface_place_above(surface->wl_subsurface, toplevel_data->client_surface->wl_surface);
++        }
+         else
+-            wl_subsurface_place_above(surface->wl_subsurface, toplevel_surface->wl_surface);
++        {
++            /* The client surface (e.g. DXVK canvas) may be owned by a child
++             * window rather than the toplevel itself.  Walk the children to
++             * find it so that popup subsurfaces (menus, floating widgets) are
++             * placed above the rendering canvas and receive input correctly. */
++            struct wayland_client_surface *child_client = NULL;
++            HWND child = NtUserGetWindowRelative(surface->toplevel_hwnd, GW_CHILD);
++            while (child)
++            {
++                struct wayland_win_data *child_data = wayland_win_data_get_nolock(child);
++                if (child_data && child_data->client_surface &&
++                    child_data->client_surface->wl_subsurface)
++                {
++                    child_client = child_data->client_surface;
++                    break;
++                }
++                child = NtUserGetWindowRelative(child, GW_HWNDNEXT);
++            }
++
++            if (child_client)
++                wl_subsurface_place_above(surface->wl_subsurface, child_client->wl_surface);
++            else
++                wl_subsurface_place_above(surface->wl_subsurface, toplevel_surface->wl_surface);
++        }
+         wl_surface_commit(toplevel_surface->wl_surface);
+ 
+         memset(&surface->processing, 0, sizeof(surface->processing));

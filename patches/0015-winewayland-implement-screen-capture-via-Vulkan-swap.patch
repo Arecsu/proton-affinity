@@ -1,0 +1,1014 @@
+From d77761d5576f4e84981f6f0a00eda6af054ac780 Mon Sep 17 00:00:00 2001
+From: Arecsu <alejandro9r@gmail.com>
+Date: Sun, 3 May 2026 23:24:19 -0300
+Subject: [PATCH] winewayland: implement screen capture via Vulkan swapchain
+ readback
+
+Adds a synchronous on-demand path that captures the most-recently-presented
+Vulkan swapchain image associated with a window into a host-visible BGRA8
+buffer, exposed to display drivers via the new win32u_vulkan_capture_window
+entry point. The wayland driver wires this into pGetImage so that
+GDI / GDI+ screen captures (BitBlt-from-screen, Graphics.CopyFromScreen)
+return real on-screen pixels for windows rendered by Vulkan-backed
+clients such as DXVK.
+
+win32u/vulkan.c:
+- Promote the present mutex to file scope and add a hwnd-keyed surface
+  registry so display drivers can locate a swapchain by window handle.
+- Track the most-recently-presented image index, queue, and a per-swapchain
+  present counter on every successful vkQueuePresentKHR.
+- Lazily allocate per-swapchain capture resources (B8G8R8A8_UNORM blit
+  image + host-visible mapped buffer + command pool / buffer / fence)
+  sized to the current swapchain extent, reallocated on extent change.
+- Force the swapchain's imageUsage to include TRANSFER_SRC so the host
+  swapchain images can serve as the source of vkCmdBlitImage.
+- Implement do_capture: blit last-presented image -> blit image -> copy
+  to host-visible buffer on the same queue used for present, with
+  bounded fence wait. The blit step uniformly handles any swapchain
+  format and any extent, eliminating per-format CPU paths.
+- Cache the captured pixels keyed by the swapchain's present counter:
+  pollers (such as the color-picker magnifier) that sample faster than
+  the application produces frames return the already-mapped buffer
+  directly, with no GPU work and no second copy.
+- Force opaque alpha on the captured pixels, since swapchain images
+  carry undefined alpha but GDI+ consumers may interpret the result as
+  ARGB and render zero-alpha pixels fully transparent.
+
+winewayland.drv:
+- New bitblt.c with the minimal DC plumbing (CreateDC / CreateCompatibleDC
+  / DeleteDC) needed for the wayland driver to appear in the GDI DC stack,
+  and pGetImage which builds the destination buffer and delegates the
+  per-window painting to wayland_composite_capture.
+- wayland_composite_capture in window.c: snapshots all wayland-managed
+  windows under win_data_mutex, sorts entries by containment depth so
+  parent windows paint first and children overlay them, then for each
+  Vulkan-backed window pulls fresh pixels via win32u_vulkan_capture_window
+  and for each shm-backed window copies from its existing buffer.
+- Toplevel-reparenting fallback in WAYLAND_WindowPosChanged: if the
+  natural toplevel ancestor of a window has no wayland role (typically
+  a hidden helper window owned by middleware such as DXVK), pick the
+  largest visible toplevel surface as the parent so popups (color-picker
+  magnifier, tooltips) become visible.
+- Wire the GDI dc_funcs into waylanddrv_funcs and expose the struct
+  externally so bitblt.c can reference it from push_dc_driver.
+---
+ dlls/win32u/vulkan.c                   | 429 ++++++++++++++++++++++++-
+ dlls/winewayland.drv/Makefile.in       |   1 +
+ dlls/winewayland.drv/bitblt.c          | 140 ++++++++
+ dlls/winewayland.drv/waylanddrv.h      |  12 +
+ dlls/winewayland.drv/waylanddrv_main.c |   7 +-
+ dlls/winewayland.drv/window.c          | 188 +++++++++++
+ include/wine/vulkan_driver.h           |  10 +
+ 7 files changed, 782 insertions(+), 5 deletions(-)
+ create mode 100644 dlls/winewayland.drv/bitblt.c
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 826494706110..721dbecab61c 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -46,6 +46,18 @@ static PFN_vkEnumerateInstanceExtensionProperties p_vkEnumerateInstanceExtension
+ static void *vulkan_handle;
+ static struct vulkan_funcs vulkan_funcs;
+ 
++/* Serializes vkQueuePresentKHR and any external queue submissions performed
++ * on swapchain images (see win32u_vulkan_capture_window). */
++static pthread_mutex_t vulkan_present_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* Registry of HWND-bearing surfaces, used by win32u_vulkan_capture_window
++ * to locate the swapchain associated with a window. Protected by vulkan_present_lock. */
++static struct list surface_list = LIST_INIT(surface_list);
++
++struct swapchain;
++struct vulkan_device;
++static void destroy_capture_resources( struct vulkan_device *device, struct swapchain *swapchain );
++
+ WINE_DECLARE_DEBUG_CHANNEL(fps);
+ 
+ static const struct vulkan_driver_funcs *driver_funcs;
+@@ -148,6 +160,7 @@ struct surface
+     struct client_surface *client;
+     struct swapchain *swapchain;
+     HWND hwnd;
++    struct list entry; /* entry in surface_list */
+ };
+ 
+ static struct surface *surface_from_handle( VkSurfaceKHR handle )
+@@ -232,6 +245,30 @@ struct swapchain
+     struct fs_comp_pipeline blit_pipeline;
+     struct fs_comp_pipeline fsr_easu_pipeline;
+     struct fs_comp_pipeline fsr_rcas_pipeline;
++
++    /* Window capture support (see win32u_vulkan_capture_window). All access
++     * is serialized by vulkan_present_lock. */
++    struct vulkan_queue *last_present_queue;
++    uint32_t last_presented_image;
++    uint64_t present_count;       /* incremented on every successful present */
++    uint64_t captured_count;      /* present_count of the cached capture */
++    BOOL has_presented;
++
++    /* Lazily created on first capture. Sized to the swapchain extent at
++     * allocation time; reallocated if the extent grows. */
++    VkImage *capture_swapchain_images; /* host swapchain images, queried on first use */
++    uint32_t capture_swapchain_image_count;
++    VkImage capture_image;             /* B8G8R8A8_UNORM, blit destination */
++    VkDeviceMemory capture_image_memory;
++    VkExtent2D capture_extent;
++    VkBuffer capture_buffer;           /* host-visible mapped buffer, copy destination */
++    VkDeviceMemory capture_buffer_memory;
++    void *capture_pixels;
++    VkDeviceSize capture_buffer_size;
++    VkCommandPool capture_cmd_pool;
++    VkCommandBuffer capture_cmd;
++    VkFence capture_fence;
++    BOOL capture_in_flight;
+ };
+ 
+ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
+@@ -1765,6 +1802,10 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
+     surface->obj.instance = instance;
+     instance->p_insert_object( instance, &surface->obj.obj );
+ 
++    pthread_mutex_lock( &vulkan_present_lock );
++    list_add_tail( &surface_list, &surface->entry );
++    pthread_mutex_unlock( &vulkan_present_lock );
++
+     if (dummy) NtUserDestroyWindow( dummy );
+ 
+     *ret = surface->obj.client.surface;
+@@ -1782,6 +1823,10 @@ static void win32u_vkDestroySurfaceKHR( VkInstance client_instance, VkSurfaceKHR
+     TRACE( "instance %p, handle 0x%s, allocator %p\n", instance, wine_dbgstr_longlong( client_surface ), allocator );
+     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
+ 
++    pthread_mutex_lock( &vulkan_present_lock );
++    list_remove( &surface->entry );
++    pthread_mutex_unlock( &vulkan_present_lock );
++
+     instance->p_vkDestroySurfaceKHR( instance->host.instance, surface->obj.host.surface, NULL /* allocator */ );
+     client_surface_release( surface->client );
+ 
+@@ -2860,6 +2905,10 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+                    create_info_host.imageFormat );
+     }
+ 
++    /* Window capture (win32u_vulkan_capture_window) reads from swapchain images
++     * via vkCmdBlitImage; ensure the host swapchain advertises this. */
++    create_info_host.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++
+     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
+     {
+         free( swapchain );
+@@ -2871,6 +2920,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+     client_surface_add_ref(surface->client);
+     surface->swapchain = swapchain;
+     swapchain->extents = create_info->imageExtent;
++    if (!swapchain->format) swapchain->format = create_info_host.imageFormat;
+     instance->p_insert_object( instance, &swapchain->obj.obj );
+ 
+     if (swapchain->fshack_dpi)
+@@ -2933,6 +2983,10 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
+         free( swapchain->fs_hack_images );
+     }
+ 
++    pthread_mutex_lock( &vulkan_present_lock );
++    destroy_capture_resources( device, swapchain );
++    pthread_mutex_unlock( &vulkan_present_lock );
++
+     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
+     if (swapchain->surface)
+     {
+@@ -3323,10 +3377,369 @@ static void *win32u_vk_find_struct_(void *s, VkStructureType t)
+     return NULL;
+ }
+ 
+-static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
++/* Find the host memory type matching the requested property flag mask, preferring
++ * cached memory for HOST_VISIBLE host-readback buffers. */
++static uint32_t find_memory_type( struct vulkan_physical_device *physical_device,
++                                  uint32_t type_bits, VkMemoryPropertyFlags required,
++                                  VkMemoryPropertyFlags preferred )
++{
++    VkPhysicalDeviceMemoryProperties props;
++    uint32_t fallback = ~0u, i;
++
++    physical_device->instance->p_vkGetPhysicalDeviceMemoryProperties( physical_device->host.physical_device, &props );
++    for (i = 0; i < props.memoryTypeCount; i++)
++    {
++        VkMemoryPropertyFlags flags = props.memoryTypes[i].propertyFlags;
++        if (!(type_bits & (1u << i))) continue;
++        if ((flags & required) != required) continue;
++        if ((flags & preferred) == preferred) return i;
++        if (fallback == ~0u) fallback = i;
++    }
++    return fallback;
++}
++
++static void destroy_capture_resources( struct vulkan_device *device, struct swapchain *swapchain )
++{
++    if (swapchain->capture_fence)
++    {
++        if (swapchain->capture_in_flight)
++            device->p_vkWaitForFences( device->host.device, 1, &swapchain->capture_fence, VK_TRUE, ~0ull );
++        device->p_vkDestroyFence( device->host.device, swapchain->capture_fence, NULL );
++        swapchain->capture_fence = VK_NULL_HANDLE;
++        swapchain->capture_in_flight = FALSE;
++    }
++    if (swapchain->capture_cmd)
++    {
++        device->p_vkFreeCommandBuffers( device->host.device, swapchain->capture_cmd_pool, 1, &swapchain->capture_cmd );
++        swapchain->capture_cmd = VK_NULL_HANDLE;
++    }
++    if (swapchain->capture_cmd_pool)
++    {
++        device->p_vkDestroyCommandPool( device->host.device, swapchain->capture_cmd_pool, NULL );
++        swapchain->capture_cmd_pool = VK_NULL_HANDLE;
++    }
++    if (swapchain->capture_pixels)
++    {
++        device->p_vkUnmapMemory( device->host.device, swapchain->capture_buffer_memory );
++        swapchain->capture_pixels = NULL;
++    }
++    if (swapchain->capture_buffer)
++    {
++        device->p_vkDestroyBuffer( device->host.device, swapchain->capture_buffer, NULL );
++        swapchain->capture_buffer = VK_NULL_HANDLE;
++    }
++    if (swapchain->capture_buffer_memory)
++    {
++        device->p_vkFreeMemory( device->host.device, swapchain->capture_buffer_memory, NULL );
++        swapchain->capture_buffer_memory = VK_NULL_HANDLE;
++    }
++    if (swapchain->capture_image)
++    {
++        device->p_vkDestroyImage( device->host.device, swapchain->capture_image, NULL );
++        swapchain->capture_image = VK_NULL_HANDLE;
++    }
++    if (swapchain->capture_image_memory)
++    {
++        device->p_vkFreeMemory( device->host.device, swapchain->capture_image_memory, NULL );
++        swapchain->capture_image_memory = VK_NULL_HANDLE;
++    }
++    free( swapchain->capture_swapchain_images );
++    swapchain->capture_swapchain_images = NULL;
++    swapchain->capture_swapchain_image_count = 0;
++    swapchain->capture_buffer_size = 0;
++    swapchain->capture_extent.width = 0;
++    swapchain->capture_extent.height = 0;
++}
++
++/* Allocate (or reallocate) the capture blit image, host-visible buffer, command
++ * buffer and fence to match the current swapchain extent. */
++static VkResult init_capture_resources( struct vulkan_device *device, struct swapchain *swapchain,
++                                        uint32_t queue_family_index )
++{
++    VkExtent2D extent = swapchain->extents;
++    VkImageCreateInfo image_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++    VkBufferCreateInfo buffer_info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++    VkMemoryAllocateInfo alloc_info = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++    VkMemoryRequirements mem_req;
++    VkDeviceSize buffer_size = (VkDeviceSize)extent.width * extent.height * 4;
++    uint32_t mem_type;
++    VkResult res;
++
++    if (swapchain->capture_extent.width == extent.width &&
++        swapchain->capture_extent.height == extent.height &&
++        swapchain->capture_image && swapchain->capture_buffer && swapchain->capture_cmd)
++        return VK_SUCCESS;
++
++    destroy_capture_resources( device, swapchain );
++
++    image_info.imageType = VK_IMAGE_TYPE_2D;
++    image_info.format = VK_FORMAT_B8G8R8A8_UNORM;
++    image_info.extent.width = extent.width;
++    image_info.extent.height = extent.height;
++    image_info.extent.depth = 1;
++    image_info.mipLevels = 1;
++    image_info.arrayLayers = 1;
++    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++    image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    if ((res = device->p_vkCreateImage( device->host.device, &image_info, NULL, &swapchain->capture_image )))
++    {
++        ERR( "vkCreateImage failed: %d\n", res );
++        return res;
++    }
++    device->p_vkGetImageMemoryRequirements( device->host.device, swapchain->capture_image, &mem_req );
++    mem_type = find_memory_type( device->physical_device, mem_req.memoryTypeBits,
++                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
++    if (mem_type == ~0u) { res = VK_ERROR_OUT_OF_DEVICE_MEMORY; goto fail; }
++    alloc_info.allocationSize = mem_req.size;
++    alloc_info.memoryTypeIndex = mem_type;
++    if ((res = device->p_vkAllocateMemory( device->host.device, &alloc_info, NULL, &swapchain->capture_image_memory ))) goto fail;
++    device->p_vkBindImageMemory( device->host.device, swapchain->capture_image, swapchain->capture_image_memory, 0 );
++
++    buffer_info.size = buffer_size;
++    buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    if ((res = device->p_vkCreateBuffer( device->host.device, &buffer_info, NULL, &swapchain->capture_buffer ))) goto fail;
++    device->p_vkGetBufferMemoryRequirements( device->host.device, swapchain->capture_buffer, &mem_req );
++    mem_type = find_memory_type( device->physical_device, mem_req.memoryTypeBits,
++                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++                                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT );
++    if (mem_type == ~0u) { res = VK_ERROR_OUT_OF_HOST_MEMORY; goto fail; }
++    alloc_info.allocationSize = mem_req.size;
++    alloc_info.memoryTypeIndex = mem_type;
++    if ((res = device->p_vkAllocateMemory( device->host.device, &alloc_info, NULL, &swapchain->capture_buffer_memory ))) goto fail;
++    device->p_vkBindBufferMemory( device->host.device, swapchain->capture_buffer, swapchain->capture_buffer_memory, 0 );
++    if ((res = device->p_vkMapMemory( device->host.device, swapchain->capture_buffer_memory, 0, VK_WHOLE_SIZE, 0, &swapchain->capture_pixels ))) goto fail;
++
++    {
++        VkCommandPoolCreateInfo pool_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++        VkCommandBufferAllocateInfo cmd_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++        VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++
++        pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++        pool_info.queueFamilyIndex = queue_family_index;
++        if ((res = device->p_vkCreateCommandPool( device->host.device, &pool_info, NULL, &swapchain->capture_cmd_pool ))) goto fail;
++        cmd_info.commandPool = swapchain->capture_cmd_pool;
++        cmd_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        cmd_info.commandBufferCount = 1;
++        if ((res = device->p_vkAllocateCommandBuffers( device->host.device, &cmd_info, &swapchain->capture_cmd ))) goto fail;
++        if ((res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &swapchain->capture_fence ))) goto fail;
++    }
++
++    swapchain->capture_extent = extent;
++    swapchain->capture_buffer_size = buffer_size;
++    /* Invalidate the cached capture so the next call performs a fresh GPU
++     * copy at the new extent. */
++    swapchain->captured_count = 0;
++    if (swapchain->present_count == 0) swapchain->present_count = 1;
++    TRACE( "allocated capture resources for swapchain %p (%ux%u)\n", swapchain, extent.width, extent.height );
++    return VK_SUCCESS;
++
++fail:
++    ERR( "init_capture_resources failed: %d\n", res );
++    destroy_capture_resources( device, swapchain );
++    return res;
++}
++
++static VkResult do_capture( struct vulkan_device *device, struct swapchain *swapchain )
++{
++    VkImage src_image;
++    VkCommandBuffer cmd = swapchain->capture_cmd;
++    VkCommandBufferBeginInfo begin_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
++    VkImageMemoryBarrier barriers[2] = {{0}};
++    VkImageBlit blit = {0};
++    VkBufferImageCopy copy = {0};
++    VkSubmitInfo submit_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
++    VkResult res;
++
++    if (swapchain->fshack_dpi && swapchain->fs_hack_images)
++        src_image = swapchain->fs_hack_images[swapchain->last_presented_image].swapchain_image;
++    else if (swapchain->capture_swapchain_images && swapchain->last_presented_image < swapchain->capture_swapchain_image_count)
++        src_image = swapchain->capture_swapchain_images[swapchain->last_presented_image];
++    else
++        return VK_ERROR_INITIALIZATION_FAILED;
++
++    /* A previous capture's wait may have timed out, leaving the fence still
++     * pending. Reset is undefined while the GPU may still touch its associated
++     * resources, so wait it out with a generous bound before reuse. */
++    if (swapchain->capture_in_flight)
++    {
++        res = device->p_vkWaitForFences( device->host.device, 1, &swapchain->capture_fence, VK_TRUE, 1000 * 1000 * 1000ull );
++        if (res != VK_SUCCESS) return res;
++        swapchain->capture_in_flight = FALSE;
++    }
++    device->p_vkResetFences( device->host.device, 1, &swapchain->capture_fence );
++    device->p_vkResetCommandBuffer( cmd, 0 );
++    device->p_vkBeginCommandBuffer( cmd, &begin_info );
++
++    /* Source: PRESENT_SRC -> TRANSFER_SRC. Dest: UNDEFINED -> TRANSFER_DST. */
++    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++    barriers[0].srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
++    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++    barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barriers[0].image = src_image;
++    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    barriers[0].subresourceRange.levelCount = 1;
++    barriers[0].subresourceRange.layerCount = 1;
++
++    barriers[1] = barriers[0];
++    barriers[1].srcAccessMask = 0;
++    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    barriers[1].image = swapchain->capture_image;
++
++    device->p_vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                    0, 0, NULL, 0, NULL, 2, barriers );
++
++    /* Blit src -> capture_image. Using vkCmdBlitImage handles both format
++     * conversion (any swapchain format -> BGRA8) and any extent mismatch. */
++    blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    blit.srcSubresource.layerCount = 1;
++    blit.srcOffsets[1].x = swapchain->capture_extent.width;
++    blit.srcOffsets[1].y = swapchain->capture_extent.height;
++    blit.srcOffsets[1].z = 1;
++    blit.dstSubresource = blit.srcSubresource;
++    blit.dstOffsets[1] = blit.srcOffsets[1];
++
++    device->p_vkCmdBlitImage( cmd, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                              swapchain->capture_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                              1, &blit, VK_FILTER_NEAREST );
++
++    /* capture_image: TRANSFER_DST -> TRANSFER_SRC for the readback copy. */
++    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++    barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    barriers[0].image = swapchain->capture_image;
++    device->p_vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                    0, 0, NULL, 0, NULL, 1, barriers );
++
++    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    copy.imageSubresource.layerCount = 1;
++    copy.imageExtent.width = swapchain->capture_extent.width;
++    copy.imageExtent.height = swapchain->capture_extent.height;
++    copy.imageExtent.depth = 1;
++    device->p_vkCmdCopyImageToBuffer( cmd, swapchain->capture_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                      swapchain->capture_buffer, 1, &copy );
++
++    /* Restore source image to PRESENT_SRC so the application's next present
++     * sees the layout it expects. */
++    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++    barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
++    barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++    barriers[0].image = src_image;
++    device->p_vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                                    0, 0, NULL, 0, NULL, 1, barriers );
++
++    device->p_vkEndCommandBuffer( cmd );
++
++    submit_info.commandBufferCount = 1;
++    submit_info.pCommandBuffers = &cmd;
++    if ((res = device->p_vkQueueSubmit( swapchain->last_present_queue->host.queue, 1, &submit_info, swapchain->capture_fence )))
++    {
++        ERR( "vkQueueSubmit failed: %d\n", res );
++        return res;
++    }
++    swapchain->capture_in_flight = TRUE;
++
++    /* Bounded wait: 100 ms is generous for a transfer-queue copy of a single
++     * frame. Returning early avoids hanging the GDI caller if the GPU is wedged;
++     * destroy_capture_resources will perform the unbounded wait if needed. */
++    res = device->p_vkWaitForFences( device->host.device, 1, &swapchain->capture_fence, VK_TRUE, 100 * 1000 * 1000ull );
++    if (res == VK_SUCCESS) swapchain->capture_in_flight = FALSE;
++    else WARN( "vkWaitForFences returned %d\n", res );
++    return res;
++}
++
++/**********************************************************************
++ *           win32u_vulkan_capture_window
++ *
++ * Capture the most-recently-presented Vulkan swapchain image associated
++ * with hwnd into a host-visible BGRA8 buffer owned by win32u, and return
++ * a pointer to the mapped pixels via *bits.
++ *
++ * The returned pointer remains valid until the next capture for the same
++ * hwnd or until the swapchain is destroyed; callers must not free it.
++ *
++ * Returns FALSE if hwnd has no associated Vulkan swapchain, the swapchain
++ * has not yet presented a frame, or the GPU copy could not be performed.
++ */
++BOOL win32u_vulkan_capture_window( HWND hwnd, void **bits, UINT *width, UINT *height )
+ {
+-    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++    struct surface *surface, *found = NULL;
++    struct swapchain *swapchain;
++    struct vulkan_device *device;
++    BOOL ret = FALSE;
+ 
++    pthread_mutex_lock( &vulkan_present_lock );
++
++    LIST_FOR_EACH_ENTRY( surface, &surface_list, struct surface, entry )
++    {
++        if (surface->hwnd == hwnd && surface->swapchain && surface->swapchain->has_presented)
++        {
++            found = surface;
++            break;
++        }
++    }
++    if (!found) goto done;
++
++    swapchain = found->swapchain;
++    device = swapchain->last_present_queue->device;
++
++    if (init_capture_resources( device, swapchain, swapchain->last_present_queue->info.queueFamilyIndex ) != VK_SUCCESS)
++        goto done;
++
++    if (!swapchain->capture_swapchain_images)
++    {
++        uint32_t count = 0;
++        device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, &count, NULL );
++        if (!count) goto done;
++        if (!(swapchain->capture_swapchain_images = calloc( count, sizeof(VkImage) ))) goto done;
++        device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, &count, swapchain->capture_swapchain_images );
++        swapchain->capture_swapchain_image_count = count;
++    }
++
++    /* Skip the GPU copy when the swapchain hasn't presented anything new
++     * since the last capture: the mapped buffer still holds valid pixels.
++     * This dominates pollers like the color-picker magnifier, which often
++     * sample faster than the application produces frames. */
++    if (swapchain->captured_count != swapchain->present_count)
++    {
++        if (do_capture( device, swapchain ) != VK_SUCCESS) goto done;
++        /* Force opaque alpha once per fresh capture: swapchain pixels carry
++         * undefined or zero alpha, but GDI+ consumers (Graphics.CopyFromScreen)
++         * may treat the result as ARGB and render a zero-alpha buffer
++         * fully transparent. */
++        {
++            uint32_t *p = swapchain->capture_pixels;
++            uint32_t n = swapchain->capture_extent.width * swapchain->capture_extent.height;
++            for (uint32_t k = 0; k < n; k++) p[k] |= 0xFF000000u;
++        }
++        swapchain->captured_count = swapchain->present_count;
++    }
++
++    *bits = swapchain->capture_pixels;
++    *width = swapchain->capture_extent.width;
++    *height = swapchain->capture_extent.height;
++    ret = TRUE;
++
++done:
++    pthread_mutex_unlock( &vulkan_present_lock );
++    return ret;
++}
++
++static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
++{
+     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
+     struct vulkan_queue *queue = vulkan_queue_from_handle( client_queue );
+     struct vulkan_device *device = queue->device;
+@@ -3426,9 +3839,17 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+         present_info->pWaitSemaphores = &blit_sema;
+     }
+ 
+-    pthread_mutex_lock( &lock );
++    pthread_mutex_lock( &vulkan_present_lock );
++    for (uint32_t i = 0; i < present_info->swapchainCount; i++)
++    {
++        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
++        swapchain->last_presented_image = present_info->pImageIndices[i];
++        swapchain->last_present_queue = queue;
++        swapchain->present_count++;
++        swapchain->has_presented = TRUE;
++    }
+     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+-    pthread_mutex_unlock( &lock );
++    pthread_mutex_unlock( &vulkan_present_lock );
+ 
+     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+     {
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index 1d71d0a92eda..15c765b0231c 100644
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -5,6 +5,7 @@ UNIX_LIBS = -lwin32u $(WAYLAND_CLIENT_LIBS) $(WAYLAND_EGL_LIBS) $(XKBCOMMON_LIBS
+ IMPORTS = user32 win32u
+ 
+ SOURCES = \
++	bitblt.c \
+ 	color-management-v1.xml \
+ 	content-type-v1.xml \
+ 	cursor-shape-v1.xml \
+diff --git a/dlls/winewayland.drv/bitblt.c b/dlls/winewayland.drv/bitblt.c
+new file mode 100644
+index 000000000000..9e5c9a1205d2
+--- /dev/null
++++ b/dlls/winewayland.drv/bitblt.c
+@@ -0,0 +1,140 @@
++/*
++ * Wayland driver GDI integration for screen capture
++ *
++ * Copyright 2026 Alejandro Romano (Arecsu)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++
++#include "waylanddrv.h"
++
++#include "wine/vulkan_driver.h"
++
++/* Minimal physdev: the wayland driver does not own a backing surface for GDI
++ * DCs, but a physdev entry is required so the driver appears in the DC stack
++ * and pGetImage reaches WAYLAND_GetImage for screen DCs. */
++struct wayland_physdev
++{
++    struct gdi_physdev dev;
++};
++
++/***********************************************************************
++ *           WAYLAND_CreateDC
++ */
++BOOL WAYLAND_CreateDC(PHYSDEV *pdev, LPCWSTR device, LPCWSTR output, const DEVMODEW *initData)
++{
++    struct wayland_physdev *physdev;
++
++    if (!(physdev = calloc(1, sizeof(*physdev)))) return FALSE;
++    push_dc_driver(pdev, &physdev->dev, &waylanddrv_funcs.dc_funcs);
++    return TRUE;
++}
++
++/***********************************************************************
++ *           WAYLAND_CreateCompatibleDC
++ */
++BOOL WAYLAND_CreateCompatibleDC(PHYSDEV orig, PHYSDEV *pdev)
++{
++    struct wayland_physdev *physdev;
++
++    if (!(physdev = calloc(1, sizeof(*physdev)))) return FALSE;
++    push_dc_driver(pdev, &physdev->dev, &waylanddrv_funcs.dc_funcs);
++    return TRUE;
++}
++
++/***********************************************************************
++ *           WAYLAND_DeleteDC
++ */
++BOOL WAYLAND_DeleteDC(PHYSDEV dev)
++{
++    free(dev);
++    return TRUE;
++}
++
++static void wayland_getimage_free(struct gdi_image_bits *bits)
++{
++    free(bits->param);
++}
++
++/***********************************************************************
++ *           WAYLAND_GetImage
++ *
++ * Returns the on-screen pixels covered by src->visrect by compositing the
++ * contents of all wayland-managed windows that intersect the rectangle.
++ * Vulkan-rendered windows are captured via win32u_vulkan_capture_window;
++ * GDI-backed windows are sampled from their cached shm contents.
++ *
++ * Called by GDI for BitBlt-from-screen and Graphics.CopyFromScreen, which
++ * is how applications such as Affinity Designer drive the color picker
++ * magnifier preview.
++ */
++DWORD WAYLAND_GetImage(PHYSDEV dev, BITMAPINFO *info, struct gdi_image_bits *bits,
++                       struct bitblt_coords *src)
++{
++    int width = src->visrect.right - src->visrect.left;
++    int height = src->visrect.bottom - src->visrect.top;
++    void *pixels;
++
++    info->bmiHeader.biSize          = sizeof(info->bmiHeader);
++    info->bmiHeader.biPlanes        = 1;
++    info->bmiHeader.biBitCount      = 32;
++    info->bmiHeader.biCompression   = BI_RGB;
++    info->bmiHeader.biXPelsPerMeter = 0;
++    info->bmiHeader.biYPelsPerMeter = 0;
++    info->bmiHeader.biClrUsed       = 0;
++    info->bmiHeader.biClrImportant  = 0;
++
++    if (!bits) return ERROR_SUCCESS; /* color-information query */
++
++    info->bmiHeader.biWidth     = width;
++    info->bmiHeader.biHeight    = -height; /* top-down */
++    info->bmiHeader.biSizeImage = width * height * 4;
++
++    if (!(pixels = calloc(1, width * height * 4))) return ERROR_OUTOFMEMORY;
++    wayland_composite_capture(pixels, width, height, src->visrect.left, src->visrect.top);
++
++    /* Force opaque alpha across the whole captured frame: GDI shm buffers
++     * carry whatever alpha the GDI layer wrote (often zero) and consumers
++     * that interpret BI_RGB 32bpp as ARGB would render zero-alpha pixels
++     * fully transparent. The captured Vulkan region is already opaque. */
++    {
++        uint32_t *p = pixels;
++        int i, n = width * height;
++        for (i = 0; i < n; i++) p[i] |= 0xFF000000u;
++    }
++
++    src->x -= src->visrect.left;
++    src->y -= src->visrect.top;
++    OffsetRect(&src->visrect, -src->visrect.left, -src->visrect.top);
++
++    bits->ptr = pixels;
++    bits->is_copy = TRUE;
++    bits->free = wayland_getimage_free;
++    bits->param = pixels;
++    return ERROR_SUCCESS;
++}
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index eef2b7da0f88..8d47a71ef5d1 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -492,6 +492,18 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
+ void ensure_window_surface_contents(HWND hwnd);
++BOOL wayland_composite_capture(char *dest, int dest_w, int dest_h, int dest_x, int dest_y);
++
++/**********************************************************************
++ *          Wayland BitBlt / GDI
++ */
++
++extern const struct user_driver_funcs waylanddrv_funcs;
++
++BOOL WAYLAND_CreateDC(PHYSDEV *pdev, LPCWSTR device, LPCWSTR output, const DEVMODEW *initData);
++BOOL WAYLAND_CreateCompatibleDC(PHYSDEV orig, PHYSDEV *pdev);
++BOOL WAYLAND_DeleteDC(PHYSDEV dev);
++DWORD WAYLAND_GetImage(PHYSDEV dev, BITMAPINFO *info, struct gdi_image_bits *bits, struct bitblt_coords *src);
+ 
+ /**********************************************************************
+  *          Wayland Keyboard
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index 30af71121932..e7192cea51b6 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -33,8 +33,13 @@
+ 
+ char *process_name = NULL;
+ 
+-static const struct user_driver_funcs waylanddrv_funcs =
++const struct user_driver_funcs waylanddrv_funcs =
+ {
++    .dc_funcs.pCreateDC = WAYLAND_CreateDC,
++    .dc_funcs.pCreateCompatibleDC = WAYLAND_CreateCompatibleDC,
++    .dc_funcs.pDeleteDC = WAYLAND_DeleteDC,
++    .dc_funcs.pGetImage = WAYLAND_GetImage,
++    .dc_funcs.priority = GDI_PRIORITY_GRAPHICS_DRV,
+     .pClipboardWindowProc = WAYLAND_ClipboardWindowProc,
+     .pClipCursor = WAYLAND_ClipCursor,
+     .pDesktopWindowProc = WAYLAND_DesktopWindowProc,
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index cbf19df248ef..b78498a4bd5b 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -33,6 +33,7 @@
+ #include "waylanddrv.h"
+ 
+ #include "wine/debug.h"
++#include "wine/vulkan_driver.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
+@@ -554,6 +555,29 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
+     toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
+ 
++    /* The natural toplevel ancestor (via NtUserGetAncestor / owner walk) can
++     * resolve to a window that has no wayland role yet — typically a hidden
++     * helper window created by middleware such as DXVK. Subsurfaces parented
++     * under a roleless surface are never displayed by the compositor. As a
++     * fallback, pick the largest visible toplevel surface as the parent so
++     * popups (color-picker magnifier, tooltips, etc.) become visible. */
++    if (toplevel_surface && toplevel_surface->role == WAYLAND_SURFACE_ROLE_NONE)
++    {
++        struct wayland_surface *fallback = NULL;
++        struct wayland_win_data *iter;
++
++        RB_FOR_EACH_ENTRY(iter, &win_data_rb, struct wayland_win_data, entry)
++        {
++            struct wayland_surface *s = iter->wayland_surface;
++            if (!s || s->role != WAYLAND_SURFACE_ROLE_TOPLEVEL || iter->hwnd == hwnd) continue;
++            if (!fallback ||
++                s->content_width * s->content_height >
++                fallback->content_width * fallback->content_height)
++                fallback = s;
++        }
++        toplevel_surface = fallback;
++    }
++
+     data->rects = *new_rects;
+     data->is_fullscreen = fullscreen;
+     data->managed = managed;
+@@ -1065,6 +1089,170 @@ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd)
+     return shm_buffer;
+ }
+ 
++/* Per-window snapshot taken under win_data_mutex so the heavy pixel work below
++ * can run without holding the mutex. A window is captured as either a Vulkan
++ * client (vk == TRUE, capture happens later via win32u_vulkan_capture_window)
++ * or a GDI surface backed by shm (vk == FALSE). */
++struct capture_entry
++{
++    HWND hwnd;
++    RECT visible;
++    int depth;                       /* containment depth, used for paint order */
++    BOOL vk;
++    struct wayland_shm_buffer *shm; /* ref-held; NULL when vk == TRUE */
++};
++
++static BOOL rect_contains(const RECT *outer, const RECT *inner)
++{
++    return outer->left <= inner->left && outer->top <= inner->top &&
++           outer->right >= inner->right && outer->bottom >= inner->bottom &&
++           !(outer->left == inner->left && outer->top == inner->top &&
++             outer->right == inner->right && outer->bottom == inner->bottom);
++}
++
++static int compare_capture_entries(const void *a, const void *b)
++{
++    return ((const struct capture_entry *)a)->depth - ((const struct capture_entry *)b)->depth;
++}
++
++/* Copy a w*h tile of BGRA8 pixels from src into dest at (dst_x, dst_y), where
++ * src has dimensions (src_w, src_h) and is sampled with the supplied scale.
++ * Both buffers are tightly packed (stride == width * 4). */
++static void blit_bgra(char *dest, int dest_w, int dest_h, int dst_x, int dst_y,
++                      const char *src, int src_w, int src_h, int src_x, int src_y,
++                      int copy_w, int copy_h)
++{
++    int row;
++    char *dp;
++    const char *sp;
++
++    if (dst_x < 0) { src_x -= dst_x; copy_w += dst_x; dst_x = 0; }
++    if (dst_y < 0) { src_y -= dst_y; copy_h += dst_y; dst_y = 0; }
++    if (src_x < 0 || src_y < 0) return;
++    if (src_x + copy_w > src_w) copy_w = src_w - src_x;
++    if (src_y + copy_h > src_h) copy_h = src_h - src_y;
++    if (dst_x + copy_w > dest_w) copy_w = dest_w - dst_x;
++    if (dst_y + copy_h > dest_h) copy_h = dest_h - dst_y;
++    if (copy_w <= 0 || copy_h <= 0) return;
++
++    dp = dest + (dst_y * dest_w + dst_x) * 4;
++    sp = src + (src_y * src_w + src_x) * 4;
++    for (row = 0; row < copy_h; row++)
++    {
++        memcpy(dp, sp, copy_w * 4);
++        dp += dest_w * 4;
++        sp += src_w * 4;
++    }
++}
++
++/* Composite the visible contents of all wayland-managed windows into dest, a
++ * BGRA8 buffer of size dest_w x dest_h positioned at (dest_x, dest_y) on the
++ * virtual screen. Vulkan-rendered windows are painted first (background layer),
++ * GDI-backed windows on top, mirroring the wayland subsurface stacking used at
++ * display time. Returns TRUE if any pixels were written. */
++BOOL wayland_composite_capture(char *dest, int dest_w, int dest_h, int dest_x, int dest_y)
++{
++    struct wayland_win_data *data;
++    struct capture_entry *entries = NULL;
++    int entry_count = 0, entry_capacity = 0, i;
++    BOOL wrote = FALSE;
++
++    /* Phase 1: snapshot the window list under the mutex. */
++    pthread_mutex_lock(&win_data_mutex);
++    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
++    {
++        struct capture_entry e = {0};
++        int win_w = data->rects.visible.right - data->rects.visible.left;
++        int win_h = data->rects.visible.bottom - data->rects.visible.top;
++
++        if (win_w <= 0 || win_h <= 0) continue;
++        if (!data->window_contents && !data->client_surface) continue;
++
++        e.hwnd = data->hwnd;
++        e.visible = data->rects.visible;
++        e.vk = (data->client_surface != NULL);
++        if (!e.vk) wayland_shm_buffer_ref((e.shm = data->window_contents));
++
++        if (entry_count >= entry_capacity)
++        {
++            entry_capacity = entry_capacity ? entry_capacity * 2 : 16;
++            entries = realloc(entries, entry_capacity * sizeof(*entries));
++        }
++        entries[entry_count++] = e;
++    }
++    pthread_mutex_unlock(&win_data_mutex);
++
++    /* Phase 2: order entries by containment depth (parents before children) so
++     * a child window's pixels overwrite its parent's, mirroring on-screen
++     * stacking without requiring full Z-order traversal of the window tree. */
++    for (i = 0; i < entry_count; i++)
++    {
++        int j;
++        entries[i].depth = 0;
++        for (j = 0; j < entry_count; j++)
++            if (j != i && rect_contains(&entries[j].visible, &entries[i].visible))
++                entries[i].depth++;
++    }
++    qsort(entries, entry_count, sizeof(*entries), compare_capture_entries);
++
++    /* Phase 3: paint into dest in depth order. */
++    for (i = 0; i < entry_count; i++)
++    {
++        struct capture_entry *e = &entries[i];
++        int win_w = e->visible.right - e->visible.left;
++        int win_h = e->visible.bottom - e->visible.top;
++        int overlap_l, overlap_t, overlap_r, overlap_b, copy_w, copy_h;
++
++        overlap_l = max(dest_x, (int)e->visible.left);
++        overlap_t = max(dest_y, (int)e->visible.top);
++        overlap_r = min(dest_x + dest_w, (int)e->visible.right);
++        overlap_b = min(dest_y + dest_h, (int)e->visible.bottom);
++        copy_w = overlap_r - overlap_l;
++        copy_h = overlap_b - overlap_t;
++        if (copy_w <= 0 || copy_h <= 0) continue;
++
++        if (e->vk)
++        {
++            void *bits;
++            UINT src_w, src_h;
++            double sx, sy;
++            int src_x, src_y, dst_x, dst_y, scaled_w, scaled_h;
++
++            if (!win32u_vulkan_capture_window(e->hwnd, &bits, &src_w, &src_h)) continue;
++
++            sx = (double)src_w / win_w;
++            sy = (double)src_h / win_h;
++            src_x = (int)((overlap_l - e->visible.left) * sx);
++            src_y = (int)((overlap_t - e->visible.top) * sy);
++            dst_x = overlap_l - dest_x;
++            dst_y = overlap_t - dest_y;
++            scaled_w = (int)(copy_w * sx);
++            scaled_h = (int)(copy_h * sy);
++
++            blit_bgra(dest, dest_w, dest_h, dst_x, dst_y,
++                      bits, src_w, src_h, src_x, src_y, scaled_w, scaled_h);
++            wrote = TRUE;
++        }
++        else if (e->shm && e->shm->map_data)
++        {
++            int src_x = overlap_l - (int)e->visible.left;
++            int src_y = overlap_t - (int)e->visible.top;
++            int dst_x = overlap_l - dest_x;
++            int dst_y = overlap_t - dest_y;
++
++            blit_bgra(dest, dest_w, dest_h, dst_x, dst_y,
++                      e->shm->map_data, e->shm->width, e->shm->height,
++                      src_x, src_y, copy_w, copy_h);
++            wrote = TRUE;
++        }
++    }
++
++    for (i = 0; i < entry_count; i++)
++        if (entries[i].shm) wayland_shm_buffer_unref(entries[i].shm);
++    free(entries);
++    return wrote;
++}
++
+ void ensure_window_surface_contents(HWND hwnd)
+ {
+     struct wayland_surface *wayland_surface;
+diff --git a/include/wine/vulkan_driver.h b/include/wine/vulkan_driver.h
+index 19346fc610df..e16760e9f409 100644
+--- a/include/wine/vulkan_driver.h
++++ b/include/wine/vulkan_driver.h
+@@ -90,6 +90,7 @@ struct VkDevice_T
+ #ifdef WINE_UNIX_LIB
+ 
+ #include <pthread.h>
++#include "ntuser.h"
+ #include "wine/rbtree.h"
+ #include "wine/list.h"
+ 
+@@ -373,6 +374,15 @@ struct vulkan_driver_funcs
+     void (*p_map_device_extensions)( struct vulkan_device_extensions *extensions );
+ };
+ 
++/* Capture the most-recently-presented Vulkan swapchain image associated with hwnd
++ * into a host-visible BGRA8 buffer owned by win32u. On success returns TRUE and
++ * fills *bits with a pointer to the mapped pixels (caller must not free), and
++ * *width / *height with the captured dimensions; the row stride is *width * 4.
++ * The pointer remains valid until the next capture for the same hwnd or until
++ * the swapchain is destroyed. Returns FALSE if hwnd has no associated swapchain,
++ * the swapchain has not yet presented, or the GPU copy failed. */
++W32KAPI BOOL win32u_vulkan_capture_window( HWND hwnd, void **bits, UINT *width, UINT *height );
++
+ #endif /* WINE_UNIX_LIB */
+ 
+ #endif /* __WINE_VULKAN_DRIVER_H */
+-- 
+2.54.0
+
