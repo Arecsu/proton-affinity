@@ -47,7 +47,7 @@ For that matter, I decided to use `proton-cachyos` as the foundational base, as 
 
 ### Dropbox lock files note
 
-Affinity creates NTFS Alternate Data Stream files (e.g. `foo.af~lock~:com.dropbox.ignored`) as Dropbox lock markers. On Linux, Wine stores these as sibling files with a colon in the name. Patch 0016 makes Wine automatically delete these stream files when the parent document is closed, and marks them hidden from Wine's own filesystem view.
+Affinity creates NTFS Alternate Data Stream files (e.g. `foo.af~lock~:com.dropbox.ignored`) as Dropbox lock markers. On Linux, Wine stores these as sibling files with a colon in the name. Patch 0016 makes Wine automatically delete these stream files when the parent document is closed as it would under Windows, and marks them hidden from Wine's own filesystem view.
 
 **Linux file managers (Nautilus, Dolphin, etc.) may still show these files.** They follow Unix hiding conventions: a leading dot, or in some implementations a trailing `~` at the end (I guess?). A colon in the middle of a filename doesn't match either convention, so file managers won't hide it. This is outside Wine's control; it would require changing how Wine names stream files on disk which is pretty hacky.
 
